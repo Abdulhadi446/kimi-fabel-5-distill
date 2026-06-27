@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Kimi-VL-A3B-Thinking-2506 — Full Fine-Tuning (no LoRA)
-Hardware: 64GB VRAM GPU, 32GB RAM
+Kimi-VL-A3B-Thinking-2506 — QLoRA Fine-Tuning (4-bit)
+Hardware: 2x Tesla T4 (15GB each), 30GB CPU RAM
 """
 
 import subprocess, sys, os, json, requests
@@ -17,7 +17,7 @@ def run(cmd, **kwargs):
 run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
 
 # ─── 1. INSTALL ───────────────────────────────────────────────────────────────
-run("pip install -q 'llamafactory[torch,metrics]' deepspeed requests")
+run("pip install -q llamafactory bitsandbytes requests accelerate")
 
 # ─── 2. LOGIN ─────────────────────────────────────────────────────────────────
 HF_TOKEN = os.getenv("HF_TOKEN", "")
@@ -85,85 +85,82 @@ with open("data/dataset_info.json", "w") as f:
 
 print("Dataset ready in ./data/")
 
-# ─── 4. WRITE TRAINING CONFIG (full fine-tune, no LoRA) ──────────────────────
+# ─── 4. WRITE TRAINING CONFIG (QLoRA — 4-bit, 2x T4) ────────────────────────
 train_config = """
 ### model
 model_name_or_path: moonshotai/Kimi-VL-A3B-Thinking-2506
 trust_remote_code: true
 
+### quantization — loads model in 4-bit (~8GB), fits on single T4
+quantization_bit: 4
+quantization_method: bitsandbytes
+
 ### method
 stage: sft
 do_train: true
-finetuning_type: full          # full fine-tuning, all weights updated
+finetuning_type: lora
+
+### lora
+lora_target: all
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.05
 
 ### dataset
 dataset: kimi_vl_sft
 dataset_dir: ./data
 template: kimi_vl
-cutoff_len: 4096
+cutoff_len: 2048
 overwrite_cache: true
 preprocessing_num_workers: 4
 
 ### output
-output_dir: ./kimi-vl-full-out
+output_dir: ./kimi-vl-qlora-out
 logging_steps: 10
 save_steps: 200
 plot_loss: true
 overwrite_output_dir: true
 
-### training
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4    # effective batch = 8
-learning_rate: 2.0e-5             # lower LR for full fine-tuning vs LoRA
+### training — conservative settings for T4
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8    # effective batch = 8
+learning_rate: 1.0e-4
 num_train_epochs: 3
 lr_scheduler_type: cosine
 warmup_ratio: 0.05
-bf16: true
-gradient_checkpointing: true      # saves VRAM during backward pass
+fp16: true                        # T4 doesn't support bf16, use fp16
+gradient_checkpointing: true
 ddp_timeout: 180000000
-
-### deepspeed (ZeRO-2 for single GPU, ZeRO-3 for multi-GPU)
-deepspeed: ds_config.json
 """
 
-with open("train_full.yaml", "w") as f:
+with open("train_qlora.yaml", "w") as f:
     f.write(train_config.strip())
 
-# ─── 5. WRITE DEEPSPEED CONFIG ────────────────────────────────────────────────
-# ZeRO-2: shards optimizer states + gradients across GPU memory — good for single 64GB GPU
-ds_config = {
-    "train_batch_size": "auto",
-    "train_micro_batch_size_per_gpu": "auto",
-    "gradient_accumulation_steps": "auto",
-    "gradient_clipping": 1.0,
-    "zero_optimization": {
-        "stage": 2,
-        "allgather_partitions": True,
-        "allgather_bucket_size": 2e8,
-        "reduce_scatter": True,
-        "reduce_bucket_size": 2e8,
-        "overlap_comm": True,
-        "contiguous_gradients": True,
-        "offload_optimizer": {
-            "device": "cpu",        # offload optimizer states to CPU RAM (you have 32GB)
-            "pin_memory": True
-        }
-    },
-    "bf16": {
-        "enabled": True
-    },
-    "steps_per_print": 10,
-    "wall_clock_breakdown": False
-}
+print("Config written to train_qlora.yaml")
 
-with open("ds_config.json", "w") as f:
-    json.dump(ds_config, f, indent=2)
+# ─── 5. TRAIN (multi-GPU with torchrun for 2x T4) ────────────────────────────
+run("torchrun --nproc_per_node=2 --master_port=29500 "
+    "$(which llamafactory-cli) train train_qlora.yaml")
 
-print("Configs written: train_full.yaml + ds_config.json")
+# ─── 6. MERGE LORA INTO BASE MODEL ───────────────────────────────────────────
+merge_config = """
+model_name_or_path: moonshotai/Kimi-VL-A3B-Thinking-2506
+trust_remote_code: true
+adapter_name_or_path: ./kimi-vl-qlora-out
+finetuning_type: lora
+template: kimi_vl
+export_dir: ./kimi-vl-merged
+export_size: 5
+export_device: cpu
+export_legacy_format: false
+"""
 
-# ─── 6. TRAIN ─────────────────────────────────────────────────────────────────
-run("llamafactory-cli train train_full.yaml")
+with open("merge_qlora.yaml", "w") as f:
+    f.write(merge_config.strip())
 
-print("\n✅ Done! Full model saved to ./kimi-vl-full-out")
+print("\nMerging LoRA adapter into base model...")
+run("llamafactory-cli export merge_qlora.yaml")
+
+print("\n✅ Done! Merged model saved to ./kimi-vl-merged")
 print("Upload with:")
-print("  huggingface-cli upload thetrillioniar/Kimi-VL-A3B-Thinking-2506-Fabel5-SFT ./kimi-vl-full-out")
+print("  huggingface-cli upload thetrillioniar/Kimi-VL-A3B-Thinking-2506-Fabel5 ./kimi-vl-merged")
